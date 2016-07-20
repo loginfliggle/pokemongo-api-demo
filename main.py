@@ -1,17 +1,31 @@
-import requests
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+import os
 import re
+import sys
 import struct
 import json
+import requests
 import argparse
 import pokemon_pb2
 import time
+import csv
+import pytz
+
+from pushbullet import Pushbullet
 
 from google.protobuf.internal import encoder
 
 from datetime import datetime
+from datetime import timedelta
+
 from geopy.geocoders import GoogleV3
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+try:
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+except ImportError:
+    pass
 from s2sphere import *
 
 def encode(cellid):
@@ -32,7 +46,13 @@ def getNeighbors():
         prev = prev.prev()
     return walk
 
+with open('config.json') as file:
+	credentials = json.load(file)
 
+PTC_CLIENT_SECRET = credentials.get('PTC_CLIENT_SECRET', None)
+ANDROID_ID = credentials.get('ANDROID_ID', None)
+SERVICE = credentials.get('SERVICE', None)
+CLIENT_SIG = credentials.get('CLIENT_SIG', None)
 
 API_URL = 'https://pgorelease.nianticlabs.com/plfe/rpc'
 LOGIN_URL = 'https://sso.pokemon.com/sso/login?service=https%3A%2F%2Fsso.pokemon.com%2Fsso%2Foauth2.0%2FcallbackAuthorize'
@@ -51,9 +71,15 @@ FLOAT_LONG = 0
 deflat, deflng = 0, 0
 default_step = 0.001
 
-NUM_STEPS = 5
-DATA_FILE = 'data.json'
-DATA = []
+NUM_STEPS = 10
+PKMN_DATA_FILE = 'pkmn.json'
+PKSTOP_DATA_FILE = 'pkstop.json'
+GYM_DATA_FILE = 'gym.json'
+DATA = {
+    'pokemon':{},
+    'pokestop':{},
+    'gym':{}
+}
 
 def f2i(float):
   return struct.unpack('<Q', struct.pack('<d', float))[0]
@@ -67,48 +93,90 @@ def h2f(hex):
 def prune():
     # prune despawned pokemon
     cur_time = int(time.time())
-    for i, poke in reversed(list(enumerate(DATA))):
+    for (pokehash, poke) in DATA['pokemon'].items():
         poke['timeleft'] = poke['timeleft'] - (cur_time - poke['timestamp'])
         poke['timestamp'] = cur_time
         if poke['timeleft'] <= 0:
-            DATA.pop(i)
+            del DATA['pokemon'][pokehash]
 
 def write_data_to_file():
     prune()
 
-    with open(DATA_FILE, 'w') as f:
-        json.dump(DATA, f, indent=2)
+    # different file for bandwith save
+    with open(PKMN_DATA_FILE, 'w') as f:
+        json.dump(DATA['pokemon'], f, indent=2)
+
+    with open(PKSTOP_DATA_FILE, 'w') as f:
+        json.dump(DATA['pokestop'], f, indent=2)
+
+    with open(GYM_DATA_FILE, 'w') as f:
+        json.dump(DATA['gym'], f, indent=2)
 
 def add_pokemon(pokeId, name, lat, lng, timestamp, timeleft):
-    DATA.append({
-        'id': pokeId,
-        'name': name,
-        'lat': lat,
-        'lng': lng,
-        'timestamp': timestamp,
-        'timeleft': timeleft
-    });
+    pokehash = '%s:%s:%s' % (lat, lng, pokeId)
+    if pokehash in DATA['pokemon']:
+        if abs(DATA['pokemon'][pokehash]['timeleft'] - timeleft) < 2:
+            # Assume it's the same one and average the expiry time
+            DATA['pokemon'][pokehash]['timeleft'] += timeleft
+            DATA['pokemon'][pokehash]['timeleft'] /= 2
+        else:
+            print('[-] Two %s at the same location (%s,%s)' % (name, lat, lng))
+            DATA['pokemon'][pokehash]['timeleft'] = min(DATA['pokemon'][pokehash]['timeleft'], timeleft)
+    else:
+        DATA['pokemon'][pokehash] = {
+            'id': pokeId,
+            'name': name,
+            'lat': lat,
+            'lng': lng,
+            'timestamp': timestamp,
+            'timeleft': timeleft
+        }
+
+def add_pokestop(pokestopId, lat, lng, timeleft):
+    if not pokestopId in DATA['pokestop']:
+        DATA['pokestop'][pokestopId] = {
+            'id': pokestopId,
+            'lat': lat,
+            'lng': lng,
+            'timeleft': timeleft
+        }
+
+def add_gym(gymId, team, lat, lng, points):
+    if not gymId in DATA['gym']:
+        DATA['gym'][gymId] = {
+            'id': gymId,
+            'team': team,
+            'lat': lat,
+            'lng': lng,
+            'points': points
+        }
 
 def set_location(location_name):
     geolocator = GoogleV3()
-    loc = geolocator.geocode(location_name)
-
-    print('[!] Your given location: {}'.format(loc.address.encode('utf-8')))
-    print('[!] lat/long/alt: {} {} {}'.format(loc.latitude, loc.longitude, loc.altitude))
-
+    prog = re.compile('^(\-?\d+(\.\d+)?),\s*(\-?\d+(\.\d+)?)$')
     global deflat
     global deflng
-    deflat, deflng = loc.latitude, loc.longitude
+    if prog.match(location_name):
+        local_lat, local_lng = [float(x) for x in location_name.split(",")]
+        alt = 0
+        deflat, deflng = local_lat, local_lng
+    else:
+        loc = geolocator.geocode(location_name)
+        deflat, deflng = local_lat, local_lng = loc.latitude, loc.longitude
+        alt = loc.altitude
+        print '[!] Your given location: {}'.format(loc.address.encode('utf-8'))
 
-    set_location_coords(loc.latitude, loc.longitude, loc.altitude)
+    print('[!] lat/long/alt: {} {} {}'.format(local_lat, local_lng, alt))
+    set_location_coords(local_lat, local_lng, alt)
 
-def set_location_coords(lat, long, alt):
+
+def set_location_coords(lat, lng, alt):
     global COORDS_LATITUDE, COORDS_LONGITUDE, COORDS_ALTITUDE
     global FLOAT_LAT, FLOAT_LONG
     FLOAT_LAT = lat
-    FLOAT_LONG = long
+    FLOAT_LONG = lng
     COORDS_LATITUDE = f2i(lat) # 0x4042bd7c00000000 # f2i(lat)
-    COORDS_LONGITUDE = f2i(long) # 0xc05e8aae40000000 #f2i(long)
+    COORDS_LONGITUDE = f2i(lng) # 0xc05e8aae40000000 #f2i(lng)
     COORDS_ALTITUDE = f2i(alt)
 
 def get_location_coords():
@@ -154,13 +222,13 @@ def api_req(api_endpoint, access_token, *mehs, **kw):
 
             if DEBUG:
                 print("[ ] Sleeping for 1 second")
-            time.sleep(1)
+            time.sleep(0.51)
             return p_ret
         except Exception, e:
             if DEBUG:
                 print(e)
             print('[-] API request error, retrying')
-            time.sleep(1)
+            time.sleep(0.51)
             continue
 
 def get_profile(access_token, api, useauth, *reqq):
@@ -203,9 +271,22 @@ def get_api_endpoint(access_token, api = API_URL):
 
 def login_ptc(username, password):
     print('[!] login for: {}'.format(username))
-    head = {'User-Agent': 'niantic'}
+    head = {'User-Agent': 'Niantic App'}
     r = SESSION.get(LOGIN_URL, headers=head)
-    jdata = json.loads(r.content)
+
+    try:
+        jdata = json.loads(r.content)
+    except ValueError, e:
+        if DEBUG:
+            debug('login_ptc: could not decode JSON from {}'.format(r.content))
+        return None
+
+    # Maximum password length is 15 (sign in page enforces this limit, API does not)
+
+    if len(password) > 15:
+        print '[!] Trimming password to 15 characters'
+        password = password[:15]
+
     data = {
         'lt': jdata['lt'],
         'execution': jdata['execution'],
@@ -226,7 +307,7 @@ def login_ptc(username, password):
     data1 = {
         'client_id': 'mobile-app_pokemon-go',
         'redirect_uri': 'https://www.nianticlabs.com/pokemongo/error',
-        'client_secret': 'w8ScCUXJQc6kXKw8FiOhd8Fixzht18Dq3PEVkUCP5ZPxtgyWsbTvWHFLm2wNY0JR',
+        'client_secret': PTC_CLIENT_SECRET,
         'grant_type': 'refresh_token',
         'code': ticket,
     }
@@ -264,7 +345,10 @@ def raw_heartbeat(api_endpoint, access_token, response):
         m4,
         pokemon_pb2.RequestEnvelop.Requests(),
         m5)
-    payload = response.payload[0]
+    try:
+        payload = response.payload[0]
+    except (AttributeError, IndexError):
+        return
     heartbeat = pokemon_pb2.ResponseEnvelop.HeartbeatPayload()
     heartbeat.ParseFromString(payload)
     return heartbeat
@@ -280,7 +364,7 @@ def heartbeat(api_endpoint, access_token, response):
             print('[-] Heartbeat missed, retrying')
 
 
-def scan(api_endpoint, access_token, response, origin, pokemons):
+def scan(api_endpoint, access_token, response, origin, pokemons, pushbullet = None, pokeWantedList = None, csvFile = None):
     steps = 0
     steplimit = NUM_STEPS
     pos = 1
@@ -305,24 +389,28 @@ def scan(api_endpoint, access_token, response, origin, pokemons):
         visible = []
 
         for hh in hs:
-            for cell in hh.cells:
-                for wild in cell.WildPokemon:
-                    hash = wild.SpawnPointId + ':' + str(wild.pokemon.PokemonId)
-                    if (hash not in seen):
-                        visible.append(wild)
-                        seen.add(hash)
+            try:
+                for cell in hh.cells:
+                    for wild in cell.WildPokemon:
+                        hash = wild.SpawnPointId + ':' + str(wild.pokemon.PokemonId)
+                        if (hash not in seen):
+                            visible.append(wild)
+                            seen.add(hash)
+                    if cell.Fort:
+                        for Fort in cell.Fort:
+                            if Fort.Enabled == True:
+                                if Fort.GymPoints:
+                                    add_gym(Fort.FortId, Fort.Team, Fort.Latitude, Fort.Longitude, Fort.GymPoints)
+                                elif Fort.FortType:
+                                    expire_time = 0
+                                    if Fort.LureInfo.LureExpiresTimestampMs:
+                                        expire_time = datetime\
+                                            .fromtimestamp(Fort.LureInfo.LureExpiresTimestampMs / 1000.0)\
+                                            .strftime("%H:%M:%S")
+                                    add_pokestop(Fort.FortId, Fort.Latitude, Fort.Longitude, expire_time)
 
-        for cell in h.cells:
-            if cell.NearbyPokemon:
-                other = LatLng.from_point(Cell(CellId(cell.S2CellId)).get_center())
-                diff = other - origin
-                # print(diff)
-                difflat = diff.lat().degrees
-                difflng = diff.lng().degrees
-                if len(cell.NearbyPokemon) > 0:
-                    print('[+] Found pokemon!')
-                for poke in cell.NearbyPokemon:
-                        print('    (%s) %s' % (poke.PokedexNumber, pokemons[poke.PokedexNumber - 1]['Name']))
+            except AttributeError:
+                break
 
         for poke in visible:
             other = LatLng.from_degrees(poke.Latitude, poke.Longitude)
@@ -331,8 +419,32 @@ def scan(api_endpoint, access_token, response, origin, pokemons):
             difflat = diff.lat().degrees
             difflng = diff.lng().degrees
 
+            print("(%s) %s is visible at (%s, %s) for %s seconds" % (poke.pokemon.PokemonId, pokemons[poke.pokemon.PokemonId - 1]['Name'], poke.Latitude, poke.Longitude, poke.TimeTillHiddenMs / 1000))
+
             timestamp = int(time.time())
             add_pokemon(poke.pokemon.PokemonId, pokemons[poke.pokemon.PokemonId - 1]['Name'], poke.Latitude, poke.Longitude, timestamp, poke.TimeTillHiddenMs / 1000)
+
+            
+            if pokeWantedList is not None:
+                pokeID = poke.pokemon.PokemonId
+                if pokeID in pokeWantedList:
+                    m, s = divmod(poke.TimeTillHiddenMs / 1000, 60)
+                    h, m = divmod(m, 60)
+                    curTime = datetime.now()
+                    spawnTime = curTime + timedelta(seconds=(poke.timeTillHiddenMs / 1000)) - timedelta(minutes=15)
+                    
+                    csvFile = open('pokeDump.csv', 'ab')
+                    csvWriter = csv.writer(csvFile)
+                    csvWriter.writerow([poke.pokemon.PokemonId] + [pokemons[poke.pokemon.PokemonId - 1]['Name']] + [poke.Latitude] + [poke.Longitude] + spawnTime)
+                    #csvWriter.writerow([poke.pokemon.PokemonId] + [pokemons[poke.pokemon.PokemonId - 1]['Name']] + [poke.Latitude] + [poke.Longitude] + [poke.TimeTillHiddenMs / 1000] + [datetime.now()])
+                    csvFile.close()
+                    
+                    if pushbullet is not None:
+                        pushTitle = "(%s) %s until %s:%s:%s" % (poke.pokemon.PokemonId, pokemons[poke.pokemon.PokemonId - 1]['Name'], curTime.hour + h, curTime.minute + m, curTime.second + s)
+                        pushLink = "http://maps.google.com/maps?z=12&t=m&q=loc:%s+%s" % (poke.Latitude, poke.Longitude)            
+                        push = pushbullet.push_link(pushTitle, pushLink)
+
+                        
 
         write_data_to_file()
 
@@ -345,14 +457,19 @@ def scan(api_endpoint, access_token, response, origin, pokemons):
 
         print('[+] Scan: %0.1f %%' % (((steps + (pos * .25) - .25) / steplimit**2) * 100))
 
+
 def main():
+    full_path = os.path.realpath(__file__)
+    (path, filename) = os.path.split(full_path)
+
     write_data_to_file()
-    pokemons = json.load(open('pokemon.json'))
+    pokemons = json.load(open(path + '/pokemon.json'))
     parser = argparse.ArgumentParser()
     parser.add_argument("-u", "--username", help="PTC Username", required=True)
     parser.add_argument("-p", "--password", help="PTC Password", required=True)
     parser.add_argument("-l", "--location", help="Location", required=True)
     parser.add_argument("-d", "--debug", help="Debug Mode", action='store_true')
+    parser.add_argument("-pb", "--pushbullet", help="Pushbullet API key (optional)", required=False)
     parser.set_defaults(DEBUG=False)
     args = parser.parse_args()
 
@@ -363,41 +480,49 @@ def main():
 
     set_location(args.location)
 
-    access_token = login_ptc(args.username, args.password)
-    if access_token is None:
-        print('[-] Error logging in: possible wrong username/password')
-        return
-    print('[+] RPC Session Token: {} ...'.format(access_token[:25]))
-
-    api_endpoint = get_api_endpoint(access_token)
-    if api_endpoint is None:
-        print('[-] RPC server offline')
-        return
-    print('[+] Received API endpoint: {}'.format(api_endpoint))
-
-    response = get_profile(access_token, api_endpoint, None)
-    if response is not None:
-        print('[+] Login successful')
-
-        payload = response.payload[0]
-        profile = pokemon_pb2.ResponseEnvelop.ProfilePayload()
-        profile.ParseFromString(payload)
-        print('[+] Username: {}'.format(profile.profile.username))
-
-        creation_time = datetime.fromtimestamp(int(profile.profile.creation_time)/1000)
-        print('[+] You are playing Pokemon Go since: {}'.format(
-            creation_time.strftime('%Y-%m-%d %H:%M:%S'),
-        ))
-
-        for curr in profile.profile.currency:
-            print('[+] {}: {}'.format(curr.type, curr.amount))
-    else:
-        print('[-] Ooops...')
-
-    origin = LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)
-
     while True:
-        scan(api_endpoint, access_token, response, origin, pokemons)
+        access_token = login_ptc(args.username, args.password)
+        if access_token is None:
+            print('[-] Error logging in: possible wrong username/password')
+            return
+        print('[+] RPC Session Token: {} ...'.format(access_token[:25]))
+
+        api_endpoint = get_api_endpoint(access_token)
+        if api_endpoint is None:
+            print('[-] RPC server offline')
+            return
+        print('[+] Received API endpoint: {}'.format(api_endpoint))
+
+        response = get_profile(access_token, api_endpoint, None)
+        if response is not None:
+            print('[+] Login successful')
+            
+            if args.pushbullet is not None:
+                pushbulletID = Pushbullet(args.pushbullet)
+
+            payload = response.payload[0]
+            profile = pokemon_pb2.ResponseEnvelop.ProfilePayload()
+            profile.ParseFromString(payload)
+            print('[+] Username: {}'.format(profile.profile.username))
+
+            creation_time = datetime.fromtimestamp(int(profile.profile.creation_time)/1000)
+            print('[+] You are playing Pokemon Go since: {}'.format(
+                creation_time.strftime('%Y-%m-%d %H:%M:%S'),
+            ))
+
+            for curr in profile.profile.currency:
+                print('[+] {}: {}'.format(curr.type, curr.amount))
+        else:
+            print('[-] Ooops...')
+
+        origin = LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)
+        
+        #pokeWantedList = ["1","2","3","4","5","6","7","8","9","23","24","25","26","27","28","31","34","35","36","37","38","39","40","57","58","59","63","64","65","66","67","68","73","74","75","76","81","82","83","86","88","89","93","94","95","100","101","103","104","105","106","107","108","113","114","115","117","122","123","124","125","126","130","131","132","137","138","139","140","141","142","143","144","145","146","147","148","149","150","151"]
+        
+        pokeWantedList = [1,2,3,4,5,6,7,8,9,23,24,25,26,27,28,31,34,35,36,37,38,39,40,57,58,59,63,64,65,66,67,68,73,74,75,76,81,82,83,86,88,89,93,94,95,100,101,103,104,105,106,107,108,113,114,115,117,122,123,124,125,126,130,131,132,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151]
+
+        for _x in range(5):
+            scan(api_endpoint, access_token, response, origin, pokemons, pushbullet = pushbulletID, pokeWantedList = pokeWantedList)
 
 
 if __name__ == '__main__':
